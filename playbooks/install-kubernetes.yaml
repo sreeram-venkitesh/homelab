@@ -2,14 +2,78 @@
 - name: Setup Kubernetes on Raspberry Pi Cluster
   hosts: all
   become: true
+  gather_facts: false
   vars:
     k8s_version: "1.35"
     pod_network_cidr: "10.244.0.0/16"
+    
   tasks:
+    - name: Setup passwordless sudo for ansible user
+      lineinfile:
+        path: /etc/sudoers.d/010_{{ ansible_user }}-nopasswd
+        line: "{{ ansible_user }} ALL=(ALL) NOPASSWD:ALL"
+        create: yes
+        mode: '0440'
+        validate: 'visudo -cf %s'
+
+    - name: Kill any running unattended-upgrade processes
+      shell: killall unattended-upgrade || true
+      changed_when: false
+      
+    - name: Stop unattended-upgrades service
+      systemd:
+        name: unattended-upgrades
+        state: stopped
+      ignore_errors: true
+
+    - name: Disable and mask unattended-upgrades
+      systemd:
+        name: unattended-upgrades
+        enabled: no
+        masked: yes
+      ignore_errors: true
+
+    - name: Remove dpkg lock files if they exist
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/dpkg/lock
+        - /var/lib/dpkg/lock-frontend
+        - /var/cache/apt/archives/lock
+      ignore_errors: true
+
+    - name: Reconfigure dpkg
+      command: dpkg --configure -a
+      changed_when: false
+      ignore_errors: true
+
+    - name: Create systemd-resolved config directory
+      file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure DNS servers for all nodes
+      copy:
+        dest: /etc/systemd/resolved.conf.d/dns.conf
+        content: |
+          [Resolve]
+          DNS=8.8.8.8 8.8.4.4 1.1.1.1
+          FallbackDNS=1.0.0.1
+        mode: '0644'
+      notify: restart systemd-resolved
+
+    - name: Restart systemd-resolved immediately
+      systemd:
+        name: systemd-resolved
+        state: restarted
+      
     - name: Update apt cache
       apt:
         update_cache: yes
         cache_valid_time: 3600
+
     - name: Install required packages
       apt:
         name:
@@ -19,11 +83,13 @@
           - gnupg
           - software-properties-common
         state: present
+
     - name: Disable swap
       shell: |
         swapoff -a
         sed -i '/ swap / s/^/#/' /etc/fstab
       changed_when: false
+
     - name: Load kernel modules
       community.general.modprobe:
         name: "{{ item }}"
@@ -31,12 +97,14 @@
       loop:
         - overlay
         - br_netfilter
+
     - name: Ensure kernel modules load on boot
       copy:
         dest: /etc/modules-load.d/k8s.conf
         content: |
           overlay
           br_netfilter
+
     - name: Configure sysctl parameters for Kubernetes
       sysctl:
         name: "{{ item.name }}"
@@ -45,18 +113,56 @@
         sysctl_file: /etc/sysctl.d/k8s.conf
         reload: yes
       loop:
-        - {name: 'net.bridge.bridge-nf-call-iptables', value: '1'}
-        - {name: 'net.bridge.bridge-nf-call-ip6tables', value: '1'}
-        - {name: 'net.ipv4.ip_forward', value: '1'}
-    - name: Configure static IP for eth0
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Create eth0 configuration script
       copy:
-        dest: /etc/network/interfaces.d/eth0
+        dest: /usr/local/bin/configure-eth0.sh
         content: |
-          auto eth0
-          iface eth0 inet static
-            address {{ eth0_ip }}
-            netmask 255.255.255.0
-      notify: restart networking
+          #!/bin/bash
+          # Bring up eth0
+          ip link set eth0 up
+          
+          # Add IP only if it doesn't exist
+          if ! ip addr show eth0 | grep -q "{{ eth0_ip }}/24"; then
+            ip addr add {{ eth0_ip }}/24 dev eth0
+          fi
+          
+          # Remove any default route via eth0 if it exists
+          ip route del default via 10.0.0.1 dev eth0 2>/dev/null || true
+        mode: '0755'
+
+    - name: Create systemd service to configure eth0 at boot
+      copy:
+        dest: /etc/systemd/system/eth0-static-ip.service
+        content: |
+          [Unit]
+          Description=Configure eth0 with static IP
+          After=network.target
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/configure-eth0.sh
+          RemainAfterExit=yes
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Enable eth0 static IP service
+      systemd:
+        name: eth0-static-ip
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Start eth0 static IP service
+      systemd:
+        name: eth0-static-ip
+        state: started
+      ignore_errors: true
+
     - name: Enable cgroup memory and cpu in cmdline.txt
       lineinfile:
         path: /boot/firmware/cmdline.txt
@@ -64,40 +170,48 @@
         regexp: '^(.*rootwait.*)$'
         line: '\1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1'
       notify: reboot required
+
     - name: Add Kubernetes apt key
       apt_key:
         url: https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
         keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
         state: present
+
     - name: Add Kubernetes apt repository
       apt_repository:
         repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
         filename: kubernetes
         state: present
+
     - name: Install containerd
       apt:
         name: containerd
         state: present
         update_cache: yes
+
     - name: Create containerd config directory
       file:
         path: /etc/containerd
         state: directory
+
     - name: Generate default containerd configuration
       shell: containerd config default > /etc/containerd/config.toml
       args:
         creates: /etc/containerd/config.toml
+
     - name: Configure containerd to use systemd cgroup driver
       lineinfile:
         path: /etc/containerd/config.toml
         regexp: '^\s+SystemdCgroup = false'
         line: '            SystemdCgroup = true'
       notify: restart containerd
+
     - name: Start and enable containerd
       systemd:
         name: containerd
         state: started
         enabled: yes
+
     - name: Install kubeadm, kubelet, and kubectl
       apt:
         name:
@@ -106,6 +220,7 @@
           - kubectl
         state: present
         update_cache: yes
+
     - name: Hold Kubernetes packages at current version
       dpkg_selections:
         name: "{{ item }}"
@@ -114,33 +229,41 @@
         - kubelet
         - kubeadm
         - kubectl
+
   handlers:
-    - name: restart networking
-      systemd:
-        name: networking
-        state: restarted
     - name: restart containerd
       systemd:
         name: containerd
         state: restarted
+
+    - name: restart systemd-resolved
+      systemd:
+        name: systemd-resolved
+        state: restarted
+
     - name: reboot required
       debug:
         msg: "Reboot required for cgroup changes to take effect"
+
 - name: Initialize Kubernetes Control Plane
   hosts: control_plane
   become: true
+  gather_facts: false
   vars:
     pod_network_cidr: "10.244.0.0/16"
+    
   tasks:
     - name: Check if cluster is already initialized
       stat:
         path: /etc/kubernetes/admin.conf
       register: kubeadm_init
+
     - name: Get wlan0 IP address
       shell: ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
       register: wlan0_ip
       changed_when: false
       when: not kubeadm_init.stat.exists
+
     - name: Initialize Kubernetes cluster
       shell: |
         kubeadm init \
@@ -150,77 +273,123 @@
           --control-plane-endpoint={{ eth0_ip }}
       when: not kubeadm_init.stat.exists
       register: kubeadm_init_output
+
     - name: Create .kube directory for root
       file:
         path: /root/.kube
         state: directory
         mode: '0755'
+
     - name: Copy admin.conf to root's kube config
       copy:
         src: /etc/kubernetes/admin.conf
         dest: /root/.kube/config
         remote_src: yes
         mode: '0600'
-    - name: Install Flannel CNI
-      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Wait for Kubernetes API server to be ready
+      shell: kubectl get nodes --kubeconfig=/etc/kubernetes/admin.conf
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Download Flannel manifest
+      get_url:
+        url: https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+        dest: /tmp/kube-flannel.yml
+        mode: '0644'
+      retries: 3
+      delay: 5
+
+    - name: Check if Flannel is already installed
+      shell: kubectl get daemonset -n kube-flannel kube-flannel-ds 2>/dev/null
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      when: not kubeadm_init.stat.exists
+      register: flannel_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Flannel CNI
+      shell: kubectl apply -f /tmp/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: flannel_check.rc != 0
+      register: flannel_install
+      until: flannel_install.rc == 0
+      retries: 5
+      delay: 10
+
     - name: Generate join command
       shell: kubeadm token create --print-join-command
       register: join_command
       changed_when: false
+
     - name: Save join command to file
       copy:
         content: "{{ join_command.stdout }}"
         dest: /tmp/kubeadm_join_command.sh
         mode: '0755'
+
     - name: Fetch kubeconfig to local machine
       fetch:
         src: /etc/kubernetes/admin.conf
         dest: ./kubeconfig-original
         flat: yes
+
     - name: Get wlan0 IP for kubeconfig update
       shell: ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
       register: control_plane_wlan_ip
       changed_when: false
+
     - name: Save wlan0 IP to local fact
       set_fact:
         cp_wlan_ip: "{{ control_plane_wlan_ip.stdout }}"
+
 - name: Update kubeconfig on local machine
   hosts: localhost
   connection: local
   gather_facts: false
+
   tasks:
     - name: Read original kubeconfig
       slurp:
         src: ./kubeconfig-original
       register: kubeconfig_content
+
     - name: Update server address in kubeconfig
       set_fact:
         updated_kubeconfig: "{{ kubeconfig_content.content | b64decode | regex_replace('server: https://[0-9.]+:6443', 'server: https://' + hostvars[groups['control_plane'][0]]['cp_wlan_ip'] + ':6443') }}"
+
     - name: Write updated kubeconfig
       copy:
         content: "{{ updated_kubeconfig }}"
         dest: ./kubeconfig
         mode: '0600'
+
     - name: Display kubeconfig location
       debug:
         msg: "Kubeconfig saved to ./kubeconfig - Use with: export KUBECONFIG=$(pwd)/kubeconfig"
+
 - name: Join Worker Nodes to Cluster
   hosts: workers
   become: true
+  gather_facts: false
+  
   tasks:
     - name: Check if node is already part of cluster
       stat:
         path: /etc/kubernetes/kubelet.conf
       register: kubelet_conf
+
     - name: Copy join command from control plane
       slurp:
         src: /tmp/kubeadm_join_command.sh
       register: join_command
       delegate_to: "{{ groups['control_plane'][0] }}"
       when: not kubelet_conf.stat.exists
+
     - name: Join the cluster
       shell: "{{ join_command.content | b64decode }}"
       when: not kubelet_conf.stat.exists
