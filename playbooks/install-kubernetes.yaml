@@ -245,6 +245,80 @@
       debug:
         msg: "Reboot required for cgroup changes to take effect"
 
+- name: Setup SSD Storage on Worker Node
+  hosts: workers
+  become: true
+  gather_facts: true
+  vars:
+    ssd_mount_point: "/mnt/ssd"
+    k8s_storage_path: "/mnt/ssd/kubernetes"
+    
+  tasks:
+    - name: Identify SSD device
+      shell: lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | grep -E "sd[a-z]" | head -n1 | awk '{print "/dev/"$1}'
+      register: ssd_device
+      changed_when: false
+      failed_when: ssd_device.stdout == ""
+
+    - name: Check if SSD has a partition
+      shell: lsblk -ln -o NAME {{ ssd_device.stdout }} | tail -n +2 | head -n1
+      register: ssd_partition_name
+      changed_when: false
+
+    - name: Set SSD partition path
+      set_fact:
+        ssd_partition: "{{ '/dev/' + ssd_partition_name.stdout if ssd_partition_name.stdout != '' else ssd_device.stdout + '1' }}"
+
+    - name: Get UUID of SSD partition
+      shell: blkid -s UUID -o value {{ ssd_partition }}
+      register: ssd_uuid
+      changed_when: false
+
+    - name: Create SSD mount point directory
+      file:
+        path: "{{ ssd_mount_point }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check if SSD is already mounted
+      shell: mount | grep "{{ ssd_mount_point }}"
+      register: mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Mount SSD
+      mount:
+        path: "{{ ssd_mount_point }}"
+        src: "UUID={{ ssd_uuid.stdout }}"
+        fstype: ext4
+        opts: defaults
+        state: mounted
+
+    - name: Add SSD to fstab for persistent mounting
+      mount:
+        path: "{{ ssd_mount_point }}"
+        src: "UUID={{ ssd_uuid.stdout }}"
+        fstype: ext4
+        opts: defaults
+        state: present
+
+    - name: Create Kubernetes storage directory on SSD
+      file:
+        path: "{{ k8s_storage_path }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Display SSD mount information
+      debug:
+        msg: 
+          - "SSD Device: {{ ssd_device.stdout }}"
+          - "SSD Partition: {{ ssd_partition }}"
+          - "UUID: {{ ssd_uuid.stdout }}"
+          - "Mounted at: {{ ssd_mount_point }}"
+          - "Kubernetes storage path: {{ k8s_storage_path }}"
+
 - name: Initialize Kubernetes Control Plane
   hosts: control_plane
   become: true
@@ -393,3 +467,119 @@
     - name: Join the cluster
       shell: "{{ join_command.content | b64decode }}"
       when: not kubelet_conf.stat.exists
+
+- name: Install Local Path Provisioner
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    k8s_storage_path: "/mnt/ssd/kubernetes"
+    worker_node_name: "homelab-worker"
+    
+  tasks:
+    - name: Wait for all nodes to be ready
+      shell: kubectl get nodes --no-headers | grep -v NotReady | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ready_nodes
+      until: ready_nodes.stdout | int >= 2
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Check if local-path-provisioner namespace exists
+      shell: kubectl get namespace local-path-storage
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: namespace_check
+      failed_when: false
+      changed_when: false
+
+    - name: Download local-path-provisioner manifest
+      get_url:
+        url: https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+        dest: /tmp/local-path-storage.yaml
+        mode: '0644'
+      when: namespace_check.rc != 0
+
+    - name: Install local-path-provisioner
+      shell: kubectl apply -f /tmp/local-path-storage.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: namespace_check.rc != 0
+      register: provisioner_install
+
+    - name: Wait for local-path-provisioner to be ready
+      shell: kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 5
+      delay: 10
+
+    - name: Create updated ConfigMap for local-path-provisioner
+      copy:
+        dest: /tmp/local-path-config.yaml
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: local-path-config
+            namespace: local-path-storage
+          data:
+            config.json: |-
+              {
+                "nodePathMap": [
+                  {
+                    "node": "{{ worker_node_name }}",
+                    "paths": ["{{ k8s_storage_path }}"]
+                  }
+                ]
+              }
+            setup: |-
+              #!/bin/sh
+              set -eu
+              mkdir -m 0777 -p "$VOL_DIR"
+            teardown: |-
+              #!/bin/sh
+              set -eu
+              rm -rf "$VOL_DIR"
+            helperPod.yaml: |-
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: helper-pod
+              spec:
+                containers:
+                - name: helper-pod
+                  image: busybox
+                  imagePullPolicy: IfNotPresent
+
+    - name: Apply updated ConfigMap
+      shell: kubectl apply -f /tmp/local-path-config.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Restart local-path-provisioner to pick up new config
+      shell: kubectl rollout restart deployment local-path-provisioner -n local-path-storage
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for local-path-provisioner restart
+      shell: kubectl rollout status deployment local-path-provisioner -n local-path-storage
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Verify StorageClass exists
+      shell: kubectl get storageclass local-path
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: storageclass_check
+      changed_when: false
+
+    - name: Display storage setup completion
+      debug:
+        msg:
+          - "Local Path Provisioner installed successfully!"
+          - "StorageClass 'local-path' is available"
+          - "Storage location: {{ k8s_storage_path }} on {{ worker_node_name }}"
+          - "You can now create PVCs with storageClassName: local-path"
