@@ -59,8 +59,8 @@
         dest: /etc/systemd/resolved.conf.d/dns.conf
         content: |
           [Resolve]
-          DNS=8.8.8.8 8.8.4.4 1.1.1.1
-          FallbackDNS=1.0.0.1
+          DNS=8.8.8.8 1.1.1.1
+          FallbackDNS=8.8.4.4
         mode: '0644'
       notify: restart systemd-resolved
 
@@ -117,51 +117,40 @@
         - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
         - { name: 'net.ipv4.ip_forward', value: '1' }
 
-    - name: Create eth0 configuration script
-      copy:
-        dest: /usr/local/bin/configure-eth0.sh
-        content: |
-          #!/bin/bash
-          # Bring up eth0
-          ip link set eth0 up
-          
-          # Add IP only if it doesn't exist
-          if ! ip addr show eth0 | grep -q "{{ eth0_ip }}/24"; then
-            ip addr add {{ eth0_ip }}/24 dev eth0
-          fi
-          
-          # Remove any default route via eth0 if it exists
-          ip route del default via 10.0.0.1 dev eth0 2>/dev/null || true
-        mode: '0755'
-
-    - name: Create systemd service to configure eth0 at boot
-      copy:
-        dest: /etc/systemd/system/eth0-static-ip.service
-        content: |
-          [Unit]
-          Description=Configure eth0 with static IP
-          After=network.target
-          
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/local/bin/configure-eth0.sh
-          RemainAfterExit=yes
-          
-          [Install]
-          WantedBy=multi-user.target
-        mode: '0644'
-
-    - name: Enable eth0 static IP service
+    - name: Stop and disable old eth0-static-ip service if it exists
       systemd:
         name: eth0-static-ip
-        enabled: yes
-        daemon_reload: yes
-
-    - name: Start eth0 static IP service
-      systemd:
-        name: eth0-static-ip
-        state: started
+        state: stopped
+        enabled: no
       ignore_errors: true
+
+    - name: Remove old eth0 service files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/eth0-static-ip.service
+        - /usr/local/bin/configure-eth0.sh
+      ignore_errors: true
+
+    - name: Configure eth0 static IP using netplan
+      copy:
+        dest: /etc/netplan/99-eth0.yaml
+        content: |
+          network:
+            version: 2
+            ethernets:
+              eth0:
+                addresses:
+                  - {{ eth0_ip }}/24
+                dhcp4: no
+                optional: true
+        mode: '0644'
+      notify: apply netplan
+
+    - name: Apply netplan configuration
+      command: netplan apply
+      changed_when: false
 
     - name: Enable cgroup memory and cpu in cmdline.txt
       lineinfile:
@@ -241,83 +230,88 @@
         name: systemd-resolved
         state: restarted
 
+    - name: apply netplan
+      command: netplan apply
+
     - name: reboot required
       debug:
         msg: "Reboot required for cgroup changes to take effect"
 
-- name: Setup SSD Storage on Worker Node
-  hosts: workers
-  become: true
-  gather_facts: true
-  vars:
-    ssd_mount_point: "/mnt/ssd"
-    k8s_storage_path: "/mnt/ssd/kubernetes"
+##### If you want to mount an SSD for installing local-path-provisioner later on
+
+# - name: Setup SSD Storage on Worker Node
+#   hosts: workers
+#   become: true
+#   gather_facts: true
+#   vars:
+#     ssd_mount_point: "/mnt/ssd"
+#     k8s_storage_path: "/mnt/ssd/kubernetes"
     
-  tasks:
-    - name: Identify SSD device
-      shell: lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | grep -E "sd[a-z]" | head -n1 | awk '{print "/dev/"$1}'
-      register: ssd_device
-      changed_when: false
-      failed_when: ssd_device.stdout == ""
+#   tasks:
+#     - name: Identify SSD device
+#       shell: lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | grep -E "sd[a-z]" | head -n1 | awk '{print "/dev/"$1}'
+#       register: ssd_device
+#       changed_when: false
+#       failed_when: ssd_device.stdout == ""
 
-    - name: Check if SSD has a partition
-      shell: lsblk -ln -o NAME {{ ssd_device.stdout }} | tail -n +2 | head -n1
-      register: ssd_partition_name
-      changed_when: false
+#     - name: Check if SSD has a partition
+#       shell: lsblk -ln -o NAME {{ ssd_device.stdout }} | tail -n +2 | head -n1
+#       register: ssd_partition_name
+#       changed_when: false
 
-    - name: Set SSD partition path
-      set_fact:
-        ssd_partition: "{{ '/dev/' + ssd_partition_name.stdout if ssd_partition_name.stdout != '' else ssd_device.stdout + '1' }}"
+#     - name: Set SSD partition path
+#       set_fact:
+#         ssd_partition: "{{ '/dev/' + ssd_partition_name.stdout if ssd_partition_name.stdout != '' else ssd_device.stdout + '1' }}"
 
-    - name: Get UUID of SSD partition
-      shell: blkid -s UUID -o value {{ ssd_partition }}
-      register: ssd_uuid
-      changed_when: false
+#     - name: Get UUID of SSD partition
+#       shell: blkid -s UUID -o value {{ ssd_partition }}
+#       register: ssd_uuid
+#       changed_when: false
 
-    - name: Create SSD mount point directory
-      file:
-        path: "{{ ssd_mount_point }}"
-        state: directory
-        mode: '0755'
+#     - name: Create SSD mount point directory
+#       file:
+#         path: "{{ ssd_mount_point }}"
+#         state: directory
+#         mode: '0755'
 
-    - name: Check if SSD is already mounted
-      shell: mount | grep "{{ ssd_mount_point }}"
-      register: mount_check
-      changed_when: false
-      failed_when: false
+#     - name: Check if SSD is already mounted
+#       shell: mount | grep "{{ ssd_mount_point }}"
+#       register: mount_check
+#       changed_when: false
+#       failed_when: false
 
-    - name: Mount SSD
-      mount:
-        path: "{{ ssd_mount_point }}"
-        src: "UUID={{ ssd_uuid.stdout }}"
-        fstype: ext4
-        opts: defaults
-        state: mounted
+#     - name: Mount SSD
+#       mount:
+#         path: "{{ ssd_mount_point }}"
+#         src: "UUID={{ ssd_uuid.stdout }}"
+#         fstype: ext4
+#         opts: defaults
+#         state: mounted
 
-    - name: Add SSD to fstab for persistent mounting
-      mount:
-        path: "{{ ssd_mount_point }}"
-        src: "UUID={{ ssd_uuid.stdout }}"
-        fstype: ext4
-        opts: defaults
-        state: present
+#     - name: Add SSD to fstab for persistent mounting
+#       mount:
+#         path: "{{ ssd_mount_point }}"
+#         src: "UUID={{ ssd_uuid.stdout }}"
+#         fstype: ext4
+#         opts: defaults
+#         state: present
 
-    - name: Create Kubernetes storage directory on SSD
-      file:
-        path: "{{ k8s_storage_path }}"
-        state: directory
-        mode: '0755'
-        owner: root
-        group: root
+#     - name: Create Kubernetes storage directory on SSD
+#       file:
+#         path: "{{ k8s_storage_path }}"
+#         state: directory
+#         mode: '0755'
+#         owner: root
+#         group: root
 
-    - name: Display SSD mount information
-      debug:
-        msg: 
-          - "SSD Device: {{ ssd_device.stdout }}"
-          - "SSD Partition: {{ ssd_partition }}"
-          - "UUID: {{ ssd_uuid.stdout }}"
-          - "Mounted at: {{ ssd_mount_point }}"
-          - "Kubernetes storage path: {{ k8s_storage_path }}"
+#     - name: Display SSD mount information
+#       debug:
+#         msg: 
+#           - "SSD Device: {{ ssd_device.stdout }}"
+#           - "SSD Partition: {{ ssd_partition }}"
+#           - "UUID: {{ ssd_uuid.stdout }}"
+#           - "Mounted at: {{ ssd_mount_point }}"
+#           - "Kubernetes storage path: {{ k8s_storage_path }}"
 
 - name: Initialize Kubernetes Control Plane
   hosts: control_plane
@@ -395,6 +389,12 @@
       retries: 5
       delay: 10
 
+    - name: Configure Flannel to use eth0 interface
+      shell: 'kubectl patch daemonset kube-flannel-ds -n kube-flannel --type json -p=''[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--iface=eth0"}]'''
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: flannel_check.rc != 0
+
     - name: Generate join command
       shell: kubeadm token create --print-join-command
       register: join_command
@@ -468,13 +468,29 @@
       shell: "{{ join_command.content | b64decode }}"
       when: not kubelet_conf.stat.exists
 
+##### If you're not using an SSD and want to install local-path-provisioner in the Raspberry Pi's SD card
+- name: Create Kubernetes Storage Directory
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    k8s_storage_path: "/opt/local-path-provisioner"
+    
+  tasks:
+    - name: Create Kubernetes storage directory
+      file:
+        path: "{{ k8s_storage_path }}"
+        state: directory
+        mode: '0777'
+        owner: root
+        group: root
+
 - name: Install Local Path Provisioner
   hosts: control_plane
   become: true
   gather_facts: false
   vars:
-    k8s_storage_path: "/mnt/ssd/kubernetes"
-    worker_node_name: "homelab-worker"
+    k8s_storage_path: "/opt/local-path-provisioner"
     
   tasks:
     - name: Wait for all nodes to be ready
@@ -530,7 +546,7 @@
               {
                 "nodePathMap": [
                   {
-                    "node": "{{ worker_node_name }}",
+                    "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
                     "paths": ["{{ k8s_storage_path }}"]
                   }
                 ]
@@ -581,5 +597,5 @@
         msg:
           - "Local Path Provisioner installed successfully!"
           - "StorageClass 'local-path' is available"
-          - "Storage location: {{ k8s_storage_path }} on {{ worker_node_name }}"
+          - "Storage location: {{ k8s_storage_path }} on all nodes"
           - "You can now create PVCs with storageClassName: local-path"
